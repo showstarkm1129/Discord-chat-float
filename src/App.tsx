@@ -7,6 +7,9 @@ type Settings = {
   avatar_url: string;
   channel_label: string;
   draft: string;
+  target_window_title: string;
+  target_process_name: string;
+  shortcut: string;
 };
 
 type SendResult = {
@@ -15,12 +18,20 @@ type SendResult = {
   message: string;
 };
 
+type TargetWindow = {
+  title: string;
+  process_name: string;
+};
+
 const emptySettings: Settings = {
   webhook_url: "",
   username: "",
   avatar_url: "",
   channel_label: "",
   draft: "",
+  target_window_title: "",
+  target_process_name: "",
+  shortcut: "Ctrl+Shift+D",
 };
 
 function App() {
@@ -30,6 +41,7 @@ function App() {
   const [isSending, setIsSending] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
+  const [targetWindows, setTargetWindows] = useState<TargetWindow[]>([]);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const destinationLabel = useMemo(() => {
@@ -40,8 +52,13 @@ function App() {
   useEffect(() => {
     invoke<Settings>("load_settings")
       .then((loaded) => {
-        setSettings({ ...emptySettings, ...loaded });
+        setSettings({
+          ...emptySettings,
+          ...loaded,
+          shortcut: loaded.shortcut || emptySettings.shortcut,
+        });
         setMessage(loaded.draft ?? "");
+        refreshWindows();
       })
       .catch(() => setError("設定を読み込めませんでした"));
   }, []);
@@ -65,10 +82,14 @@ function App() {
   async function saveSettings(nextSettings = settings) {
     setError("");
     setStatus("");
-    await invoke("save_settings", {
-      settings: { ...nextSettings, draft: message },
-    });
-    setStatus("保存しました");
+    try {
+      await invoke("save_settings", {
+        settings: { ...nextSettings, draft: message },
+      });
+      setStatus("保存しました");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function saveDraft(nextDraft: string) {
@@ -129,11 +150,35 @@ function App() {
     setError("");
     setStatus("");
     try {
-      await invoke("toggle_discord_window");
-      setStatus("Discordを切り替えました");
+      await invoke("toggle_target_window");
+      setStatus("対象ウィンドウを切り替えました");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  async function refreshWindows() {
+    try {
+      const windows = await invoke<TargetWindow[]>("list_target_windows");
+      setTargetWindows(windows);
+    } catch {
+      setTargetWindows([]);
+    }
+  }
+
+  async function selectTargetWindow(value: string) {
+    if (!value) return;
+
+    const selected = targetWindows[Number(value)];
+    if (!selected) return;
+
+    const nextSettings = {
+      ...settings,
+      target_window_title: selected.title,
+      target_process_name: selected.process_name,
+    };
+    setSettings(nextSettings);
+    await saveSettings(nextSettings);
   }
 
   function handleKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -166,7 +211,7 @@ function App() {
       <section className="top-row">
         <div>
           <p className="eyebrow">Main mode</p>
-          <h1>Discord呼び出し</h1>
+          <h1>ウィンドウ呼び出し</h1>
         </div>
         <div className="button-row">
           <button type="button" onClick={toggleDiscord}>
@@ -183,8 +228,60 @@ function App() {
       </section>
 
       <section className="mode-panel">
-        <span>Ctrl+Shift+D でDiscordを前面化 / 最小化</span>
-        <small>Discordデスクトップアプリを開いておいてください</small>
+        <span>{settings.shortcut || "Ctrl+Shift+D"} で前面化 / 最小化</span>
+        <small>
+          {settings.target_window_title
+            ? `${settings.target_process_name} / ${settings.target_window_title}`
+            : "未設定時はDiscordデスクトップアプリを探します"}
+        </small>
+      </section>
+
+      <section className="settings-panel" aria-label="呼び出し設定">
+        <div className="subheading">
+          <span>呼び出し設定</span>
+          <small>一覧を更新して、対象にしたいウィンドウを選んでください</small>
+        </div>
+        <div className="settings-grid">
+          <label>
+            対象ウィンドウ
+            <select
+              value=""
+              onFocus={refreshWindows}
+              onChange={(event) => selectTargetWindow(event.target.value)}
+            >
+              <option value="">
+                {settings.target_window_title
+                  ? `${settings.target_process_name} / ${settings.target_window_title}`
+                  : "ウィンドウを選択"}
+              </option>
+              {targetWindows.map((window, index) => (
+                <option
+                  key={`${window.process_name}-${window.title}-${index}`}
+                  value={String(index)}
+                >
+                  {window.process_name} / {window.title}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            ショートカット
+            <input
+              value={settings.shortcut}
+              placeholder="Ctrl+Shift+D"
+              onChange={(event) => updateSetting("shortcut", event.target.value)}
+              onBlur={() => saveSettings()}
+            />
+          </label>
+        </div>
+        <div className="button-row">
+          <button type="button" onClick={refreshWindows}>
+            一覧更新
+          </button>
+          <button type="button" onClick={() => saveSettings()}>
+            設定保存
+          </button>
+        </div>
       </section>
 
       {isSettingsOpen && (

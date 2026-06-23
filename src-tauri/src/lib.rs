@@ -1,11 +1,13 @@
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Mutex};
 use tauri::{AppHandle, Manager, PhysicalPosition, Runtime, WebviewWindow, WindowEvent};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use thiserror::Error;
 
 mod window_toggle;
+
+const DEFAULT_SHORTCUT: &str = "Ctrl+Shift+D";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -15,8 +17,16 @@ struct AppSettings {
     avatar_url: String,
     channel_label: String,
     draft: String,
+    target_window_title: String,
+    target_process_name: String,
+    shortcut: String,
     window_x: Option<i32>,
     window_y: Option<i32>,
+}
+
+#[derive(Default)]
+struct ShortcutRegistration {
+    current: Mutex<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +52,8 @@ enum AppError {
     Window,
     #[error("{0}")]
     TargetWindow(String),
+    #[error("ショートカットを登録できませんでした")]
+    Shortcut,
 }
 
 impl Serialize for AppError {
@@ -60,6 +72,7 @@ fn load_settings(app: AppHandle) -> Result<AppSettings, AppError> {
 
 #[tauri::command]
 fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), AppError> {
+    update_shortcut_if_needed(&app, &settings)?;
     write_settings(&app, &settings)
 }
 
@@ -130,17 +143,32 @@ fn show_quick_window(app: AppHandle) -> Result<(), AppError> {
 
 #[tauri::command]
 fn toggle_discord_window() -> Result<(), AppError> {
-    window_toggle::toggle_discord_window().map_err(AppError::TargetWindow)
+    let settings = AppSettings::default();
+    toggle_target_from_settings(&settings)
+}
+
+#[tauri::command]
+fn toggle_target_window(app: AppHandle) -> Result<(), AppError> {
+    let settings = read_settings(&app)?;
+    toggle_target_from_settings(&settings)
+}
+
+#[tauri::command]
+fn list_target_windows() -> Vec<window_toggle::WindowInfo> {
+    window_toggle::list_windows()
 }
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(ShortcutRegistration::default())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
-                    if shortcut == &quick_shortcut() && event.state() == ShortcutState::Pressed {
-                        let _ = window_toggle::toggle_discord_window()
-                            .or_else(|_| toggle_quick_window(app).map_err(|err| err.to_string()));
+                    if event.state() == ShortcutState::Pressed {
+                        let _ = shortcut;
+                        let _ = read_settings(app)
+                            .and_then(|settings| toggle_target_from_settings(&settings))
+                            .or_else(|_| toggle_quick_window(app));
                     }
                 })
                 .build(),
@@ -151,10 +179,13 @@ pub fn run() {
             send_webhook_message,
             hide_quick_window,
             show_quick_window,
-            toggle_discord_window
+            toggle_discord_window,
+            toggle_target_window,
+            list_target_windows
         ])
         .setup(|app| {
-            if let Ok(settings) = read_settings(app.handle()) {
+            let settings = read_settings(app.handle()).unwrap_or_default();
+            {
                 if let (Some(x), Some(y)) = (settings.window_x, settings.window_y) {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.set_position(PhysicalPosition::new(x, y));
@@ -162,7 +193,7 @@ pub fn run() {
                 }
             }
 
-            app.global_shortcut().register(quick_shortcut())?;
+            register_shortcut(app.handle(), &settings).map_err(|err| err.to_string())?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -177,10 +208,6 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-fn quick_shortcut() -> Shortcut {
-    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyD)
 }
 
 fn toggle_quick_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), AppError> {
@@ -199,6 +226,52 @@ fn toggle_quick_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), AppError> {
     }
 
     show_and_focus(app)
+}
+
+fn toggle_target_from_settings(settings: &AppSettings) -> Result<(), AppError> {
+    window_toggle::toggle_target_window(
+        settings.target_window_title.trim(),
+        settings.target_process_name.trim(),
+    )
+    .map_err(AppError::TargetWindow)
+}
+
+fn effective_shortcut(settings: &AppSettings) -> String {
+    let shortcut = settings.shortcut.trim();
+    if shortcut.is_empty() {
+        DEFAULT_SHORTCUT.to_string()
+    } else {
+        shortcut.to_string()
+    }
+}
+
+fn update_shortcut_if_needed<R: Runtime>(
+    app: &AppHandle<R>,
+    settings: &AppSettings,
+) -> Result<(), AppError> {
+    let shortcut = effective_shortcut(settings);
+    let state = app.state::<ShortcutRegistration>();
+    let current = state.current.lock().map_err(|_| AppError::Shortcut)?;
+    if *current == shortcut {
+        return Ok(());
+    }
+    drop(current);
+    register_shortcut(app, settings)
+}
+
+fn register_shortcut<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> Result<(), AppError> {
+    let shortcut = effective_shortcut(settings);
+    app.global_shortcut()
+        .unregister_all()
+        .map_err(|_| AppError::Shortcut)?;
+    app.global_shortcut()
+        .register(shortcut.as_str())
+        .map_err(|_| AppError::Shortcut)?;
+
+    let state = app.state::<ShortcutRegistration>();
+    let mut current = state.current.lock().map_err(|_| AppError::Shortcut)?;
+    *current = shortcut;
+    Ok(())
 }
 
 fn show_and_focus<R: Runtime>(app: &AppHandle<R>) -> Result<(), AppError> {

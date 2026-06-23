@@ -1,5 +1,6 @@
 #[cfg(windows)]
 mod platform {
+    use serde::Serialize;
     use windows::Win32::{
         Foundation::{CloseHandle, BOOL, HWND, LPARAM},
         System::Threading::{
@@ -13,13 +14,39 @@ mod platform {
         },
     };
 
+    #[derive(Debug, Clone, Serialize)]
+    pub struct WindowInfo {
+        pub title: String,
+        pub process_name: String,
+    }
+
     #[derive(Default)]
     struct SearchState {
         hwnd: Option<HWND>,
+        target_title: String,
+        target_process_name: String,
     }
 
-    pub fn toggle_discord_window() -> Result<(), String> {
-        let hwnd = find_discord_window().ok_or("Discordのウィンドウが見つかりません")?;
+    #[derive(Default)]
+    struct ListState {
+        windows: Vec<WindowInfo>,
+    }
+
+    pub fn list_windows() -> Vec<WindowInfo> {
+        let mut state = ListState::default();
+        let state_ptr = &mut state as *mut ListState;
+
+        unsafe {
+            let _ = EnumWindows(Some(enum_windows_for_list), LPARAM(state_ptr as isize));
+        }
+
+        state.windows
+    }
+
+    pub fn toggle_target_window(title: &str, process_name: &str) -> Result<(), String> {
+        let hwnd = find_target_window(title, process_name)
+            .or_else(find_discord_window)
+            .ok_or("対象ウィンドウが見つかりません")?;
 
         unsafe {
             let foreground = GetForegroundWindow();
@@ -35,7 +62,15 @@ mod platform {
     }
 
     fn find_discord_window() -> Option<HWND> {
-        let mut state = SearchState::default();
+        find_target_window("", "Discord.exe")
+    }
+
+    fn find_target_window(title: &str, process_name: &str) -> Option<HWND> {
+        let mut state = SearchState {
+            target_title: title.to_string(),
+            target_process_name: process_name.to_string(),
+            ..SearchState::default()
+        };
         let state_ptr = &mut state as *mut SearchState;
 
         unsafe {
@@ -43,6 +78,30 @@ mod platform {
         }
 
         state.hwnd
+    }
+
+    unsafe extern "system" fn enum_windows_for_list(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        if !IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+
+        let title = window_title(hwnd);
+        if title.trim().is_empty() || title == "Discord Chat Float" {
+            return true.into();
+        }
+
+        let process_name = exe_name(&process_path(hwnd));
+        if process_name.is_empty() {
+            return true.into();
+        }
+
+        let state = &mut *(lparam.0 as *mut ListState);
+        state.windows.push(WindowInfo {
+            title,
+            process_name,
+        });
+
+        true.into()
     }
 
     unsafe extern "system" fn enum_windows(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -55,15 +114,20 @@ mod platform {
             return true.into();
         }
 
-        let process_name = process_name(hwnd);
+        let process_name = exe_name(&process_path(hwnd));
         let title_lc = title.to_ascii_lowercase();
         let process_lc = process_name.to_ascii_lowercase();
-        let is_discord = process_lc.ends_with("discord.exe")
-            || process_lc.contains("\\discord\\")
-            || title_lc.contains("discord");
+        let state = &mut *(lparam.0 as *mut SearchState);
+        let target_title_lc = state.target_title.to_ascii_lowercase();
+        let target_process_lc = state.target_process_name.to_ascii_lowercase();
+        let process_matches =
+            target_process_lc.is_empty() || process_lc == target_process_lc;
+        let title_matches = target_title_lc.is_empty() || title_lc == target_title_lc;
+        let is_discord_fallback =
+            target_process_lc == "discord.exe" && (process_lc == "discord.exe" || title_lc.contains("discord"));
+        let is_target = (process_matches && title_matches) || is_discord_fallback;
 
-        if is_discord {
-            let state = &mut *(lparam.0 as *mut SearchState);
+        if is_target {
             state.hwnd = Some(hwnd);
             return false.into();
         }
@@ -82,7 +146,7 @@ mod platform {
         String::from_utf16_lossy(&buffer[..written as usize])
     }
 
-    unsafe fn process_name(hwnd: HWND) -> String {
+    unsafe fn process_path(hwnd: HWND) -> String {
         let mut process_id = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut process_id as *mut u32));
         if process_id == 0 {
@@ -110,15 +174,37 @@ mod platform {
 
         String::from_utf16_lossy(&buffer[..size as usize])
     }
+
+    fn exe_name(path: &str) -> String {
+        path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
+    }
 }
 
 #[cfg(not(windows))]
 mod platform {
-    pub fn toggle_discord_window() -> Result<(), String> {
+    use serde::Serialize;
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct WindowInfo {
+        pub title: String,
+        pub process_name: String,
+    }
+
+    pub fn list_windows() -> Vec<WindowInfo> {
+        Vec::new()
+    }
+
+    pub fn toggle_target_window(_title: &str, _process_name: &str) -> Result<(), String> {
         Err("Discord呼び出しモードは今のところWindows専用です".into())
     }
 }
 
-pub fn toggle_discord_window() -> Result<(), String> {
-    platform::toggle_discord_window()
+pub use platform::WindowInfo;
+
+pub fn list_windows() -> Vec<WindowInfo> {
+    platform::list_windows()
+}
+
+pub fn toggle_target_window(title: &str, process_name: &str) -> Result<(), String> {
+    platform::toggle_target_window(title, process_name)
 }
